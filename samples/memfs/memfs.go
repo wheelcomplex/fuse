@@ -20,33 +20,34 @@ import (
 	"os"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
 	"github.com/jacobsa/fuse/fuseutil"
 	"github.com/jacobsa/syncutil"
-	"github.com/jacobsa/timeutil"
 )
 
 type memFS struct {
 	fuseutil.NotImplementedFileSystem
 
-	/////////////////////////
-	// Dependencies
-	/////////////////////////
-
-	clock timeutil.Clock
+	// The UID and GID that every inode receives.
+	uid uint32
+	gid uint32
 
 	/////////////////////////
 	// Mutable state
 	/////////////////////////
 
-	// When acquiring this lock, the caller must hold no inode locks.
 	mu syncutil.InvariantMutex
 
 	// The collection of live inodes, indexed by ID. IDs of free inodes that may
 	// be re-used have nil entries. No ID less than fuseops.RootInodeID is ever
 	// used.
 	//
+	// All inodes are protected by the file system mutex.
+	//
+	// INVARIANT: For each inode in, in.CheckInvariants() does not panic.
 	// INVARIANT: len(inodes) > fuseops.RootInodeID
 	// INVARIANT: For all i < fuseops.RootInodeID, inodes[i] == nil
 	// INVARIANT: inodes[fuseops.RootInodeID] != nil
@@ -68,12 +69,12 @@ type memFS struct {
 // default_permissions option.
 func NewMemFS(
 	uid uint32,
-	gid uint32,
-	clock timeutil.Clock) fuse.Server {
+	gid uint32) fuse.Server {
 	// Set up the basic struct.
 	fs := &memFS{
-		clock:  clock,
 		inodes: make([]*inode, fuseops.RootInodeID+1),
+		uid:    uid,
+		gid:    gid,
 	}
 
 	// Set up the root inode.
@@ -83,7 +84,7 @@ func NewMemFS(
 		Gid:  gid,
 	}
 
-	fs.inodes[fuseops.RootInodeID] = newInode(clock, rootAttrs)
+	fs.inodes[fuseops.RootInodeID] = newInode(rootAttrs)
 
 	// Set up invariant checking.
 	fs.mu = syncutil.NewInvariantMutex(fs.checkInvariants)
@@ -132,48 +133,32 @@ func (fs *memFS) checkInvariants() {
 			panic(fmt.Sprintf("Unexected free inode ID: %v", id))
 		}
 	}
+
+	// INVARIANT: For each inode in, in.CheckInvariants() does not panic.
+	for _, in := range fs.inodes {
+		in.CheckInvariants()
+	}
 }
 
-// Find the given inode and return it with its lock held. Panic if it doesn't
-// exist.
+// Find the given inode. Panic if it doesn't exist.
 //
-// SHARED_LOCKS_REQUIRED(fs.mu)
-// EXCLUSIVE_LOCK_FUNCTION(inode.mu)
-func (fs *memFS) getInodeForModifyingOrDie(id fuseops.InodeID) (inode *inode) {
+// LOCKS_REQUIRED(fs.mu)
+func (fs *memFS) getInodeOrDie(id fuseops.InodeID) (inode *inode) {
 	inode = fs.inodes[id]
 	if inode == nil {
 		panic(fmt.Sprintf("Unknown inode: %v", id))
 	}
 
-	inode.mu.Lock()
 	return
 }
 
-// Find the given inode and return it with its lock held for reading. Panic if
-// it doesn't exist.
+// Allocate a new inode, assigning it an ID that is not in use.
 //
-// SHARED_LOCKS_REQUIRED(fs.mu)
-// SHARED_LOCK_FUNCTION(inode.mu)
-func (fs *memFS) getInodeForReadingOrDie(id fuseops.InodeID) (inode *inode) {
-	inode = fs.inodes[id]
-	if inode == nil {
-		panic(fmt.Sprintf("Unknown inode: %v", id))
-	}
-
-	inode.mu.Lock()
-	return
-}
-
-// Allocate a new inode, assigning it an ID that is not in use. Return it with
-// its lock held.
-//
-// EXCLUSIVE_LOCKS_REQUIRED(fs.mu)
-// EXCLUSIVE_LOCK_FUNCTION(inode.mu)
+// LOCKS_REQUIRED(fs.mu)
 func (fs *memFS) allocateInode(
 	attrs fuseops.InodeAttributes) (id fuseops.InodeID, inode *inode) {
-	// Create and lock the inode.
-	inode = newInode(fs.clock, attrs)
-	inode.mu.Lock()
+	// Create the inode.
+	inode = newInode(attrs)
 
 	// Re-use a free ID if possible. Otherwise mint a new one.
 	numFree := len(fs.freeInodes)
@@ -189,7 +174,7 @@ func (fs *memFS) allocateInode(
 	return
 }
 
-// EXCLUSIVE_LOCKS_REQUIRED(fs.mu)
+// LOCKS_REQUIRED(fs.mu)
 func (fs *memFS) deallocateInode(id fuseops.InodeID) {
 	fs.freeInodes = append(fs.freeInodes, id)
 	fs.inodes[id] = nil
@@ -199,30 +184,30 @@ func (fs *memFS) deallocateInode(id fuseops.InodeID) {
 // FileSystem methods
 ////////////////////////////////////////////////////////////////////////
 
-func (fs *memFS) Init(
-	op *fuseops.InitOp) (err error) {
+func (fs *memFS) StatFS(
+	ctx context.Context,
+	op *fuseops.StatFSOp) (err error) {
 	return
 }
 
 func (fs *memFS) LookUpInode(
+	ctx context.Context,
 	op *fuseops.LookUpInodeOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	// Grab the parent directory.
-	inode := fs.getInodeForReadingOrDie(op.Parent)
-	defer inode.mu.Unlock()
+	inode := fs.getInodeOrDie(op.Parent)
 
 	// Does the directory have an entry with the given name?
-	childID, ok := inode.LookUpChild(op.Name)
+	childID, _, ok := inode.LookUpChild(op.Name)
 	if !ok {
 		err = fuse.ENOENT
 		return
 	}
 
 	// Grab the child.
-	child := fs.getInodeForReadingOrDie(childID)
-	defer child.mu.Unlock()
+	child := fs.getInodeOrDie(childID)
 
 	// Fill in the response.
 	op.Entry.Child = childID
@@ -230,39 +215,39 @@ func (fs *memFS) LookUpInode(
 
 	// We don't spontaneously mutate, so the kernel can cache as long as it wants
 	// (since it also handles invalidation).
-	op.Entry.AttributesExpiration = fs.clock.Now().Add(365 * 24 * time.Hour)
+	op.Entry.AttributesExpiration = time.Now().Add(365 * 24 * time.Hour)
 	op.Entry.EntryExpiration = op.Entry.EntryExpiration
 
 	return
 }
 
 func (fs *memFS) GetInodeAttributes(
+	ctx context.Context,
 	op *fuseops.GetInodeAttributesOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	// Grab the inode.
-	inode := fs.getInodeForReadingOrDie(op.Inode)
-	defer inode.mu.Unlock()
+	inode := fs.getInodeOrDie(op.Inode)
 
 	// Fill in the response.
 	op.Attributes = inode.attrs
 
 	// We don't spontaneously mutate, so the kernel can cache as long as it wants
 	// (since it also handles invalidation).
-	op.AttributesExpiration = fs.clock.Now().Add(365 * 24 * time.Hour)
+	op.AttributesExpiration = time.Now().Add(365 * 24 * time.Hour)
 
 	return
 }
 
 func (fs *memFS) SetInodeAttributes(
+	ctx context.Context,
 	op *fuseops.SetInodeAttributesOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	// Grab the inode.
-	inode := fs.getInodeForModifyingOrDie(op.Inode)
-	defer inode.mu.Unlock()
+	inode := fs.getInodeOrDie(op.Inode)
 
 	// Handle the request.
 	inode.SetAttributes(op.Size, op.Mode, op.Mtime)
@@ -272,40 +257,38 @@ func (fs *memFS) SetInodeAttributes(
 
 	// We don't spontaneously mutate, so the kernel can cache as long as it wants
 	// (since it also handles invalidation).
-	op.AttributesExpiration = fs.clock.Now().Add(365 * 24 * time.Hour)
+	op.AttributesExpiration = time.Now().Add(365 * 24 * time.Hour)
 
 	return
 }
 
 func (fs *memFS) MkDir(
+	ctx context.Context,
 	op *fuseops.MkDirOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	// Grab the parent, which we will update shortly.
-	parent := fs.getInodeForModifyingOrDie(op.Parent)
-	defer parent.mu.Unlock()
+	parent := fs.getInodeOrDie(op.Parent)
 
 	// Ensure that the name doesn't already exist, so we don't wind up with a
 	// duplicate.
-	_, exists := parent.LookUpChild(op.Name)
+	_, _, exists := parent.LookUpChild(op.Name)
 	if exists {
 		err = fuse.EEXIST
 		return
 	}
 
-	// Set up attributes from the child, using the credentials of the calling
-	// process as owner (matching inode_init_owner, cf. http://goo.gl/5qavg8).
+	// Set up attributes from the child.
 	childAttrs := fuseops.InodeAttributes{
 		Nlink: 1,
 		Mode:  op.Mode,
-		Uid:   op.Header().Uid,
-		Gid:   op.Header().Gid,
+		Uid:   fs.uid,
+		Gid:   fs.gid,
 	}
 
 	// Allocate a child.
 	childID, child := fs.allocateInode(childAttrs)
-	defer child.mu.Unlock()
 
 	// Add an entry in the parent.
 	parent.AddChild(childID, op.Name, fuseutil.DT_Directory)
@@ -316,84 +299,98 @@ func (fs *memFS) MkDir(
 
 	// We don't spontaneously mutate, so the kernel can cache as long as it wants
 	// (since it also handles invalidation).
-	op.Entry.AttributesExpiration = fs.clock.Now().Add(365 * 24 * time.Hour)
+	op.Entry.AttributesExpiration = time.Now().Add(365 * 24 * time.Hour)
 	op.Entry.EntryExpiration = op.Entry.EntryExpiration
+
+	return
+}
+
+func (fs *memFS) MkNode(
+	ctx context.Context,
+	op *fuseops.MkNodeOp) (err error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	op.Entry, err = fs.createFile(op.Parent, op.Name, op.Mode)
+	return
+}
+
+// LOCKS_REQUIRED(fs.mu)
+func (fs *memFS) createFile(
+	parentID fuseops.InodeID,
+	name string,
+	mode os.FileMode) (entry fuseops.ChildInodeEntry, err error) {
+	// Grab the parent, which we will update shortly.
+	parent := fs.getInodeOrDie(parentID)
+
+	// Ensure that the name doesn't already exist, so we don't wind up with a
+	// duplicate.
+	_, _, exists := parent.LookUpChild(name)
+	if exists {
+		err = fuse.EEXIST
+		return
+	}
+
+	// Set up attributes for the child.
+	now := time.Now()
+	childAttrs := fuseops.InodeAttributes{
+		Nlink:  1,
+		Mode:   mode,
+		Atime:  now,
+		Mtime:  now,
+		Ctime:  now,
+		Crtime: now,
+		Uid:    fs.uid,
+		Gid:    fs.gid,
+	}
+
+	// Allocate a child.
+	childID, child := fs.allocateInode(childAttrs)
+
+	// Add an entry in the parent.
+	parent.AddChild(childID, name, fuseutil.DT_File)
+
+	// Fill in the response entry.
+	entry.Child = childID
+	entry.Attributes = child.attrs
+
+	// We don't spontaneously mutate, so the kernel can cache as long as it wants
+	// (since it also handles invalidation).
+	entry.AttributesExpiration = time.Now().Add(365 * 24 * time.Hour)
+	entry.EntryExpiration = entry.AttributesExpiration
 
 	return
 }
 
 func (fs *memFS) CreateFile(
+	ctx context.Context,
 	op *fuseops.CreateFileOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	// Grab the parent, which we will update shortly.
-	parent := fs.getInodeForModifyingOrDie(op.Parent)
-	defer parent.mu.Unlock()
-
-	// Ensure that the name doesn't already exist, so we don't wind up with a
-	// duplicate.
-	_, exists := parent.LookUpChild(op.Name)
-	if exists {
-		err = fuse.EEXIST
-		return
-	}
-
-	// Set up attributes from the child, using the credentials of the calling
-	// process as owner (matching inode_init_owner, cf. http://goo.gl/5qavg8).
-	now := fs.clock.Now()
-	childAttrs := fuseops.InodeAttributes{
-		Nlink:  1,
-		Mode:   op.Mode,
-		Atime:  now,
-		Mtime:  now,
-		Ctime:  now,
-		Crtime: now,
-		Uid:    op.Header().Uid,
-		Gid:    op.Header().Gid,
-	}
-
-	// Allocate a child.
-	childID, child := fs.allocateInode(childAttrs)
-	defer child.mu.Unlock()
-
-	// Add an entry in the parent.
-	parent.AddChild(childID, op.Name, fuseutil.DT_File)
-
-	// Fill in the response entry.
-	op.Entry.Child = childID
-	op.Entry.Attributes = child.attrs
-
-	// We don't spontaneously mutate, so the kernel can cache as long as it wants
-	// (since it also handles invalidation).
-	op.Entry.AttributesExpiration = fs.clock.Now().Add(365 * 24 * time.Hour)
-	op.Entry.EntryExpiration = op.Entry.EntryExpiration
-
-	// We have nothing interesting to put in the Handle field.
-
+	op.Entry, err = fs.createFile(op.Parent, op.Name, op.Mode)
 	return
 }
 
 func (fs *memFS) CreateSymlink(
+	ctx context.Context,
 	op *fuseops.CreateSymlinkOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	// Grab the parent, which we will update shortly.
-	parent := fs.getInodeForModifyingOrDie(op.Parent)
-	defer parent.mu.Unlock()
+	parent := fs.getInodeOrDie(op.Parent)
 
 	// Ensure that the name doesn't already exist, so we don't wind up with a
 	// duplicate.
-	_, exists := parent.LookUpChild(op.Name)
+	_, _, exists := parent.LookUpChild(op.Name)
 	if exists {
 		err = fuse.EEXIST
 		return
 	}
 
-	// Set up attributes from the child, using the credentials of the calling
-	// process as owner (matching inode_init_owner, cf. http://goo.gl/5qavg8).
-	now := fs.clock.Now()
+	// Set up attributes from the child.
+	now := time.Now()
 	childAttrs := fuseops.InodeAttributes{
 		Nlink:  1,
 		Mode:   0444 | os.ModeSymlink,
@@ -401,13 +398,12 @@ func (fs *memFS) CreateSymlink(
 		Mtime:  now,
 		Ctime:  now,
 		Crtime: now,
-		Uid:    op.Header().Uid,
-		Gid:    op.Header().Gid,
+		Uid:    fs.uid,
+		Gid:    fs.gid,
 	}
 
 	// Allocate a child.
 	childID, child := fs.allocateInode(childAttrs)
-	defer child.mu.Unlock()
 
 	// Set up its target.
 	child.target = op.Target
@@ -421,31 +417,73 @@ func (fs *memFS) CreateSymlink(
 
 	// We don't spontaneously mutate, so the kernel can cache as long as it wants
 	// (since it also handles invalidation).
-	op.Entry.AttributesExpiration = fs.clock.Now().Add(365 * 24 * time.Hour)
+	op.Entry.AttributesExpiration = time.Now().Add(365 * 24 * time.Hour)
 	op.Entry.EntryExpiration = op.Entry.EntryExpiration
 
 	return
 }
 
+func (fs *memFS) Rename(
+	ctx context.Context,
+	op *fuseops.RenameOp) (err error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	// Ask the old parent for the child's inode ID and type.
+	oldParent := fs.getInodeOrDie(op.OldParent)
+	childID, childType, ok := oldParent.LookUpChild(op.OldName)
+
+	if !ok {
+		err = fuse.ENOENT
+		return
+	}
+
+	// If the new name exists already in the new parent, make sure it's not a
+	// non-empty directory, then delete it.
+	newParent := fs.getInodeOrDie(op.NewParent)
+	existingID, _, ok := newParent.LookUpChild(op.NewName)
+	if ok {
+		existing := fs.getInodeOrDie(existingID)
+
+		var buf [4096]byte
+		if existing.isDir() && existing.ReadDir(buf[:], 0) > 0 {
+			err = fuse.ENOTEMPTY
+			return
+		}
+
+		newParent.RemoveChild(op.NewName)
+	}
+
+	// Link the new name.
+	newParent.AddChild(
+		childID,
+		op.NewName,
+		childType)
+
+	// Finally, remove the old name from the old parent.
+	oldParent.RemoveChild(op.OldName)
+
+	return
+}
+
 func (fs *memFS) RmDir(
+	ctx context.Context,
 	op *fuseops.RmDirOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	// Grab the parent, which we will update shortly.
-	parent := fs.getInodeForModifyingOrDie(op.Parent)
-	defer parent.mu.Unlock()
+	parent := fs.getInodeOrDie(op.Parent)
 
 	// Find the child within the parent.
-	childID, ok := parent.LookUpChild(op.Name)
+	childID, _, ok := parent.LookUpChild(op.Name)
 	if !ok {
 		err = fuse.ENOENT
 		return
 	}
 
 	// Grab the child.
-	child := fs.getInodeForModifyingOrDie(childID)
-	defer child.mu.Unlock()
+	child := fs.getInodeOrDie(childID)
 
 	// Make sure the child is empty.
 	if child.Len() != 0 {
@@ -463,24 +501,23 @@ func (fs *memFS) RmDir(
 }
 
 func (fs *memFS) Unlink(
+	ctx context.Context,
 	op *fuseops.UnlinkOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	// Grab the parent, which we will update shortly.
-	parent := fs.getInodeForModifyingOrDie(op.Parent)
-	defer parent.mu.Unlock()
+	parent := fs.getInodeOrDie(op.Parent)
 
 	// Find the child within the parent.
-	childID, ok := parent.LookUpChild(op.Name)
+	childID, _, ok := parent.LookUpChild(op.Name)
 	if !ok {
 		err = fuse.ENOENT
 		return
 	}
 
 	// Grab the child.
-	child := fs.getInodeForModifyingOrDie(childID)
-	defer child.mu.Unlock()
+	child := fs.getInodeOrDie(childID)
 
 	// Remove the entry within the parent.
 	parent.RemoveChild(op.Name)
@@ -492,6 +529,7 @@ func (fs *memFS) Unlink(
 }
 
 func (fs *memFS) OpenDir(
+	ctx context.Context,
 	op *fuseops.OpenDirOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -499,8 +537,7 @@ func (fs *memFS) OpenDir(
 	// We don't mutate spontaneosuly, so if the VFS layer has asked for an
 	// inode that doesn't exist, something screwed up earlier (a lookup, a
 	// cache invalidation, etc.).
-	inode := fs.getInodeForReadingOrDie(op.Inode)
-	defer inode.mu.Unlock()
+	inode := fs.getInodeOrDie(op.Inode)
 
 	if !inode.isDir() {
 		panic("Found non-dir.")
@@ -510,25 +547,22 @@ func (fs *memFS) OpenDir(
 }
 
 func (fs *memFS) ReadDir(
+	ctx context.Context,
 	op *fuseops.ReadDirOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	// Grab the directory.
-	inode := fs.getInodeForReadingOrDie(op.Inode)
-	defer inode.mu.Unlock()
+	inode := fs.getInodeOrDie(op.Inode)
 
 	// Serve the request.
-	op.Data, err = inode.ReadDir(int(op.Offset), op.Size)
-	if err != nil {
-		err = fmt.Errorf("inode.ReadDir: %v", err)
-		return
-	}
+	op.BytesRead = inode.ReadDir(op.Dst, int(op.Offset))
 
 	return
 }
 
 func (fs *memFS) OpenFile(
+	ctx context.Context,
 	op *fuseops.OpenFileOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -536,8 +570,7 @@ func (fs *memFS) OpenFile(
 	// We don't mutate spontaneosuly, so if the VFS layer has asked for an
 	// inode that doesn't exist, something screwed up earlier (a lookup, a
 	// cache invalidation, etc.).
-	inode := fs.getInodeForReadingOrDie(op.Inode)
-	defer inode.mu.Unlock()
+	inode := fs.getInodeOrDie(op.Inode)
 
 	if !inode.isFile() {
 		panic("Found non-file.")
@@ -547,18 +580,16 @@ func (fs *memFS) OpenFile(
 }
 
 func (fs *memFS) ReadFile(
+	ctx context.Context,
 	op *fuseops.ReadFileOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	// Find the inode in question.
-	inode := fs.getInodeForReadingOrDie(op.Inode)
-	defer inode.mu.Unlock()
+	inode := fs.getInodeOrDie(op.Inode)
 
 	// Serve the request.
-	op.Data = make([]byte, op.Size)
-	n, err := inode.ReadAt(op.Data, op.Offset)
-	op.Data = op.Data[:n]
+	op.BytesRead, err = inode.ReadAt(op.Dst, op.Offset)
 
 	// Don't return EOF errors; we just indicate EOF to fuse using a short read.
 	if err == io.EOF {
@@ -569,13 +600,13 @@ func (fs *memFS) ReadFile(
 }
 
 func (fs *memFS) WriteFile(
+	ctx context.Context,
 	op *fuseops.WriteFileOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	// Find the inode in question.
-	inode := fs.getInodeForModifyingOrDie(op.Inode)
-	defer inode.mu.Unlock()
+	inode := fs.getInodeOrDie(op.Inode)
 
 	// Serve the request.
 	_, err = inode.WriteAt(op.Data, op.Offset)
@@ -584,13 +615,13 @@ func (fs *memFS) WriteFile(
 }
 
 func (fs *memFS) ReadSymlink(
+	ctx context.Context,
 	op *fuseops.ReadSymlinkOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	// Find the inode in question.
-	inode := fs.getInodeForReadingOrDie(op.Inode)
-	defer inode.mu.Unlock()
+	inode := fs.getInodeOrDie(op.Inode)
 
 	// Serve the request.
 	op.Target = inode.target

@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"os"
 
+	"golang.org/x/net/context"
+
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
 	"github.com/jacobsa/fuse/fuseutil"
@@ -222,12 +224,14 @@ func (fs *fsImpl) findInodeByID(id fuseops.InodeID) (in *inode) {
 // FileSystem methods
 ////////////////////////////////////////////////////////////////////////
 
-func (fs *fsImpl) Init(
-	op *fuseops.InitOp) (err error) {
+func (fs *fsImpl) StatFS(
+	ctx context.Context,
+	op *fuseops.StatFSOp) (err error) {
 	return
 }
 
 func (fs *fsImpl) LookUpInode(
+	ctx context.Context,
 	op *fuseops.LookUpInodeOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -263,6 +267,7 @@ func (fs *fsImpl) LookUpInode(
 }
 
 func (fs *fsImpl) GetInodeAttributes(
+	ctx context.Context,
 	op *fuseops.GetInodeAttributesOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -277,6 +282,7 @@ func (fs *fsImpl) GetInodeAttributes(
 }
 
 func (fs *fsImpl) ForgetInode(
+	ctx context.Context,
 	op *fuseops.ForgetInodeOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -289,6 +295,7 @@ func (fs *fsImpl) ForgetInode(
 }
 
 func (fs *fsImpl) MkDir(
+	ctx context.Context,
 	op *fuseops.MkDirOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -320,6 +327,7 @@ func (fs *fsImpl) MkDir(
 }
 
 func (fs *fsImpl) CreateFile(
+	ctx context.Context,
 	op *fuseops.CreateFileOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -351,6 +359,7 @@ func (fs *fsImpl) CreateFile(
 }
 
 func (fs *fsImpl) OpenFile(
+	ctx context.Context,
 	op *fuseops.OpenFileOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -362,6 +371,7 @@ func (fs *fsImpl) OpenFile(
 }
 
 func (fs *fsImpl) OpenDir(
+	ctx context.Context,
 	op *fuseops.OpenDirOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()

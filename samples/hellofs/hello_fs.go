@@ -19,6 +19,8 @@ import (
 	"os"
 	"strings"
 
+	"golang.org/x/net/context"
+
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
 	"github.com/jacobsa/fuse/fuseutil"
@@ -147,11 +149,15 @@ func (fs *helloFS) patchAttributes(
 	attr.Crtime = now
 }
 
-func (fs *helloFS) Init(op *fuseops.InitOp) (err error) {
+func (fs *helloFS) StatFS(
+	ctx context.Context,
+	op *fuseops.StatFSOp) (err error) {
 	return
 }
 
-func (fs *helloFS) LookUpInode(op *fuseops.LookUpInodeOp) (err error) {
+func (fs *helloFS) LookUpInode(
+	ctx context.Context,
+	op *fuseops.LookUpInodeOp) (err error) {
 	// Find the info for the parent.
 	parentInfo, ok := gInodeInfo[op.Parent]
 	if !ok {
@@ -176,6 +182,7 @@ func (fs *helloFS) LookUpInode(op *fuseops.LookUpInodeOp) (err error) {
 }
 
 func (fs *helloFS) GetInodeAttributes(
+	ctx context.Context,
 	op *fuseops.GetInodeAttributesOp) (err error) {
 	// Find the info for this inode.
 	info, ok := gInodeInfo[op.Inode]
@@ -194,12 +201,14 @@ func (fs *helloFS) GetInodeAttributes(
 }
 
 func (fs *helloFS) OpenDir(
+	ctx context.Context,
 	op *fuseops.OpenDirOp) (err error) {
 	// Allow opening any directory.
 	return
 }
 
 func (fs *helloFS) ReadDir(
+	ctx context.Context,
 	op *fuseops.ReadDirOp) (err error) {
 	// Find the info for this inode.
 	info, ok := gInodeInfo[op.Inode]
@@ -225,30 +234,31 @@ func (fs *helloFS) ReadDir(
 
 	// Resume at the specified offset into the array.
 	for _, e := range entries {
-		op.Data = fuseutil.AppendDirent(op.Data, e)
-		if len(op.Data) > op.Size {
-			op.Data = op.Data[:op.Size]
+		n := fuseutil.WriteDirent(op.Dst[op.BytesRead:], e)
+		if n == 0 {
 			break
 		}
+
+		op.BytesRead += n
 	}
 
 	return
 }
 
 func (fs *helloFS) OpenFile(
+	ctx context.Context,
 	op *fuseops.OpenFileOp) (err error) {
 	// Allow opening any file.
 	return
 }
 
 func (fs *helloFS) ReadFile(
+	ctx context.Context,
 	op *fuseops.ReadFileOp) (err error) {
 	// Let io.ReaderAt deal with the semantics.
 	reader := strings.NewReader("Hello, world!")
 
-	op.Data = make([]byte, op.Size)
-	n, err := reader.ReadAt(op.Data, op.Offset)
-	op.Data = op.Data[:n]
+	op.BytesRead, err = reader.ReadAt(op.Dst, op.Offset)
 
 	// Special case: FUSE doesn't expect us to return io.EOF.
 	if err == io.EOF {

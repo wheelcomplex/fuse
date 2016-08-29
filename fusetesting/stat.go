@@ -18,70 +18,88 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"syscall"
 	"time"
 
 	"github.com/jacobsa/oglematchers"
 )
 
-// Match os.FileInfo values that specify an mtime equal to the given time. On
-// platforms where the Sys() method returns a struct containing an mtime, check
-// also that it matches.
+// Match os.FileInfo values that specify an mtime equal to the given time.
 func MtimeIs(expected time.Time) oglematchers.Matcher {
 	return oglematchers.NewMatcher(
-		func(c interface{}) error { return mtimeIs(c, expected) },
+		func(c interface{}) error { return mtimeIsWithin(c, expected, 0) },
 		fmt.Sprintf("mtime is %v", expected))
 }
 
-func mtimeIs(c interface{}, expected time.Time) error {
+// Like MtimeIs, but allows for a tolerance.
+func MtimeIsWithin(expected time.Time, d time.Duration) oglematchers.Matcher {
+	return oglematchers.NewMatcher(
+		func(c interface{}) error { return mtimeIsWithin(c, expected, d) },
+		fmt.Sprintf("mtime is within %v of %v", d, expected))
+}
+
+func mtimeIsWithin(c interface{}, expected time.Time, d time.Duration) error {
 	fi, ok := c.(os.FileInfo)
 	if !ok {
 		return fmt.Errorf("which is of type %v", reflect.TypeOf(c))
 	}
 
 	// Check ModTime().
-	if fi.ModTime() != expected {
-		d := fi.ModTime().Sub(expected)
-		return fmt.Errorf("which has mtime %v, off by %v", fi.ModTime(), d)
+	diff := fi.ModTime().Sub(expected)
+	absDiff := diff
+	if absDiff < 0 {
+		absDiff = -absDiff
 	}
 
-	// Check Sys().
-	if sysMtime, ok := extractMtime(fi.Sys()); ok {
-		if sysMtime != expected {
-			d := sysMtime.Sub(expected)
-			return fmt.Errorf("which has Sys() mtime %v, off by %v", sysMtime, d)
-		}
+	if !(absDiff < d) {
+		return fmt.Errorf("which has mtime %v, off by %v", fi.ModTime(), diff)
 	}
 
 	return nil
 }
 
-// Match os.FileInfo values that specify a file birth time equal to the given
-// time. On platforms where there is no birth time available, match all
-// os.FileInfo values.
-func BirthtimeIs(expected time.Time) oglematchers.Matcher {
+// Match os.FileInfo values that specify a file birth time within the supplied
+// radius of the given time. On platforms where there is no birth time
+// available, match all os.FileInfo values.
+func BirthtimeIsWithin(
+	expected time.Time,
+	d time.Duration) oglematchers.Matcher {
 	return oglematchers.NewMatcher(
-		func(c interface{}) error { return birthtimeIs(c, expected) },
-		fmt.Sprintf("birthtime is %v", expected))
+		func(c interface{}) error { return birthtimeIsWithin(c, expected, d) },
+		fmt.Sprintf("birthtime is within %v of %v", d, expected))
 }
 
-func birthtimeIs(c interface{}, expected time.Time) error {
+func birthtimeIsWithin(
+	c interface{},
+	expected time.Time,
+	d time.Duration) error {
 	fi, ok := c.(os.FileInfo)
 	if !ok {
 		return fmt.Errorf("which is of type %v", reflect.TypeOf(c))
 	}
 
-	// Check Sys().
-	if sysBirthtime, ok := extractBirthtime(fi.Sys()); ok {
-		if sysBirthtime != expected {
-			d := sysBirthtime.Sub(expected)
-			return fmt.Errorf(
-				"which has Sys() birthtime %v, off by %v",
-				sysBirthtime,
-				d)
-		}
+	t, ok := extractBirthtime(fi.Sys())
+	if !ok {
+		return nil
+	}
+
+	diff := t.Sub(expected)
+	absDiff := diff
+	if absDiff < 0 {
+		absDiff = -absDiff
+	}
+
+	if !(absDiff < d) {
+		return fmt.Errorf("which has birth time %v, off by %v", t, diff)
 	}
 
 	return nil
+}
+
+// Extract time information from the supplied file info. Panic on platforms
+// where this is not possible.
+func GetTimes(fi os.FileInfo) (atime, ctime, mtime time.Time) {
+	return getTimes(fi.Sys().(*syscall.Stat_t))
 }
 
 // Match os.FileInfo values that specify a number of links equal to the given

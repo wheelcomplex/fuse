@@ -15,9 +15,13 @@
 package cachingfs
 
 import (
+	"crypto/rand"
 	"fmt"
+	"io"
 	"os"
 	"time"
+
+	"golang.org/x/net/context"
 
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
@@ -41,6 +45,10 @@ const (
 // inode entries and attributes to be cached, used when responding to fuse
 // requests. It also exposes methods for renumbering inodes and updating mtimes
 // that are useful in testing that these durations are honored.
+//
+// Each file responds to reads with random contents. SetKeepCache can be used
+// to control whether the response to OpenFileOp tells the kernel to keep the
+// file's data in the page cache or not.
 type CachingFS interface {
 	fuseutil.FileSystem
 
@@ -55,6 +63,10 @@ type CachingFS interface {
 	// Cause further queries for the attributes of inodes to use the supplied
 	// time as the inode's mtime.
 	SetMtime(mtime time.Time)
+
+	// Instruct the file system whether or not to reply to OpenFileOp with
+	// FOPEN_KEEP_CACHE set.
+	SetKeepCache(keep bool)
 }
 
 // Create a file system that issues cacheable responses according to the
@@ -113,6 +125,9 @@ type cachingFS struct {
 	/////////////////////////
 
 	mu syncutil.InvariantMutex
+
+	// GUARDED_BY(mu)
+	keepPageCache bool
 
 	// The current ID of the lowest numbered non-root inode.
 	//
@@ -234,17 +249,27 @@ func (fs *cachingFS) SetMtime(mtime time.Time) {
 	fs.mtime = mtime
 }
 
+// LOCKS_EXCLUDED(fs.mu)
+func (fs *cachingFS) SetKeepCache(keep bool) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	fs.keepPageCache = keep
+}
+
 ////////////////////////////////////////////////////////////////////////
 // FileSystem methods
 ////////////////////////////////////////////////////////////////////////
 
-func (fs *cachingFS) Init(
-	op *fuseops.InitOp) (err error) {
+func (fs *cachingFS) StatFS(
+	ctx context.Context,
+	op *fuseops.StatFSOp) (err error) {
 	return
 }
 
 // LOCKS_EXCLUDED(fs.mu)
 func (fs *cachingFS) LookUpInode(
+	ctx context.Context,
 	op *fuseops.LookUpInodeOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -299,6 +324,7 @@ func (fs *cachingFS) LookUpInode(
 
 // LOCKS_EXCLUDED(fs.mu)
 func (fs *cachingFS) GetInodeAttributes(
+	ctx context.Context,
 	op *fuseops.GetInodeAttributesOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -328,11 +354,25 @@ func (fs *cachingFS) GetInodeAttributes(
 }
 
 func (fs *cachingFS) OpenDir(
+	ctx context.Context,
 	op *fuseops.OpenDirOp) (err error) {
 	return
 }
 
 func (fs *cachingFS) OpenFile(
+	ctx context.Context,
 	op *fuseops.OpenFileOp) (err error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	op.KeepPageCache = fs.keepPageCache
+
+	return
+}
+
+func (fs *cachingFS) ReadFile(
+	ctx context.Context,
+	op *fuseops.ReadFileOp) (err error) {
+	op.BytesRead, err = io.ReadFull(rand.Reader, op.Dst)
 	return
 }

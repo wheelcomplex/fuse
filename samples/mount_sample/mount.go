@@ -23,8 +23,8 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"syscall"
 
-	"github.com/jacobsa/bazilfuse"
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/samples/flushfs"
 	"golang.org/x/net/context"
@@ -40,6 +40,7 @@ var fFlushError = flag.Int("flushfs.flush_error", 0, "")
 var fFsyncError = flag.Int("flushfs.fsync_error", 0, "")
 
 var fReadOnly = flag.Bool("read_only", false, "Mount in read-only mode.")
+var fDebug = flag.Bool("debug", false, "Enable debug logging.")
 
 func makeFlushFS() (server fuse.Server, err error) {
 	// Check the flags.
@@ -57,11 +58,11 @@ func makeFlushFS() (server fuse.Server, err error) {
 	var fsyncErr error
 
 	if *fFlushError != 0 {
-		flushErr = bazilfuse.Errno(*fFlushError)
+		flushErr = syscall.Errno(*fFlushError)
 	}
 
 	if *fFsyncError != 0 {
-		fsyncErr = bazilfuse.Errno(*fFsyncError)
+		fsyncErr = syscall.Errno(*fFsyncError)
 	}
 
 	// Report flushes and fsyncs by writing the contents followed by a newline.
@@ -138,6 +139,10 @@ func main() {
 
 	cfg := &fuse.MountConfig{
 		ReadOnly: *fReadOnly,
+	}
+
+	if *fDebug {
+		cfg.DebugLogger = log.New(os.Stderr, "fuse: ", 0)
 	}
 
 	mfs, err := fuse.Mount(*fMountPoint, server, cfg)

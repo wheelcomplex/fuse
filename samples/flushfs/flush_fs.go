@@ -19,6 +19,8 @@ import (
 	"os"
 	"sync"
 
+	"golang.org/x/net/context"
+
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
 	"github.com/jacobsa/fuse/fuseutil"
@@ -88,16 +90,41 @@ func (fs *flushFS) barAttributes() fuseops.InodeAttributes {
 	}
 }
 
+// LOCKS_REQUIRED(fs.mu)
+func (fs *flushFS) getAttributes(id fuseops.InodeID) (
+	attrs fuseops.InodeAttributes,
+	err error) {
+	switch id {
+	case fuseops.RootInodeID:
+		attrs = fs.rootAttributes()
+		return
+
+	case fooID:
+		attrs = fs.fooAttributes()
+		return
+
+	case barID:
+		attrs = fs.barAttributes()
+		return
+
+	default:
+		err = fuse.ENOENT
+		return
+	}
+}
+
 ////////////////////////////////////////////////////////////////////////
 // FileSystem methods
 ////////////////////////////////////////////////////////////////////////
 
-func (fs *flushFS) Init(
-	op *fuseops.InitOp) (err error) {
+func (fs *flushFS) StatFS(
+	ctx context.Context,
+	op *fuseops.StatFSOp) (err error) {
 	return
 }
 
 func (fs *flushFS) LookUpInode(
+	ctx context.Context,
 	op *fuseops.LookUpInodeOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -131,30 +158,29 @@ func (fs *flushFS) LookUpInode(
 }
 
 func (fs *flushFS) GetInodeAttributes(
+	ctx context.Context,
 	op *fuseops.GetInodeAttributesOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	switch op.Inode {
-	case fuseops.RootInodeID:
-		op.Attributes = fs.rootAttributes()
-		return
+	op.Attributes, err = fs.getAttributes(op.Inode)
+	return
+}
 
-	case fooID:
-		op.Attributes = fs.fooAttributes()
-		return
+func (fs *flushFS) SetInodeAttributes(
+	ctx context.Context,
+	op *fuseops.SetInodeAttributesOp) (err error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
 
-	case barID:
-		op.Attributes = fs.barAttributes()
-		return
+	// Ignore any changes and simply return existing attributes.
+	op.Attributes, err = fs.getAttributes(op.Inode)
 
-	default:
-		err = fuse.ENOENT
-		return
-	}
+	return
 }
 
 func (fs *flushFS) OpenFile(
+	ctx context.Context,
 	op *fuseops.OpenFileOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -169,6 +195,7 @@ func (fs *flushFS) OpenFile(
 }
 
 func (fs *flushFS) ReadFile(
+	ctx context.Context,
 	op *fuseops.ReadFileOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -179,13 +206,13 @@ func (fs *flushFS) ReadFile(
 	}
 
 	// Read what we can.
-	op.Data = make([]byte, op.Size)
-	copy(op.Data, fs.fooContents[op.Offset:])
+	op.BytesRead = copy(op.Dst, fs.fooContents[op.Offset:])
 
 	return
 }
 
 func (fs *flushFS) WriteFile(
+	ctx context.Context,
 	op *fuseops.WriteFileOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -209,6 +236,7 @@ func (fs *flushFS) WriteFile(
 }
 
 func (fs *flushFS) SyncFile(
+	ctx context.Context,
 	op *fuseops.SyncFileOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -218,6 +246,7 @@ func (fs *flushFS) SyncFile(
 }
 
 func (fs *flushFS) FlushFile(
+	ctx context.Context,
 	op *fuseops.FlushFileOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -227,6 +256,7 @@ func (fs *flushFS) FlushFile(
 }
 
 func (fs *flushFS) OpenDir(
+	ctx context.Context,
 	op *fuseops.OpenDirOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -245,6 +275,7 @@ func (fs *flushFS) OpenDir(
 }
 
 func (fs *flushFS) ReadDir(
+	ctx context.Context,
 	op *fuseops.ReadDirOp) (err error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -292,13 +323,15 @@ func (fs *flushFS) ReadDir(
 
 	// Fill in the listing.
 	for _, de := range dirents {
-		op.Data = fuseutil.AppendDirent(op.Data, de)
-	}
+		n := fuseutil.WriteDirent(op.Dst[op.BytesRead:], de)
 
-	// We don't support doing this in anything more than one shot.
-	if len(op.Data) > op.Size {
-		err = fmt.Errorf("Couldn't fit listing in %v bytes", op.Size)
-		return
+		// We don't support doing this in anything more than one shot.
+		if n == 0 {
+			err = fmt.Errorf("Couldn't fit listing in %v bytes", len(op.Dst))
+			return
+		}
+
+		op.BytesRead += n
 	}
 
 	return

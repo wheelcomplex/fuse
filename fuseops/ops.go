@@ -12,103 +12,86 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package fuseops contains implementations of the fuse.Op interface that may
-// be returned by fuse.Connection.ReadOp. See documentation in that package for
-// more.
 package fuseops
 
 import (
-	"fmt"
 	"os"
 	"time"
-
-	"github.com/jacobsa/bazilfuse"
-	"golang.org/x/net/context"
 )
 
-// A common interface implemented by all ops in this package. Use a type switch
-// to find particular concrete types, responding with fuse.ENOSYS if a type is
-// not supported.
-type Op interface {
-	// A short description of the op, to be used in logging.
-	ShortDesc() string
-
-	// Return the fields common to all operations.
-	Header() OpHeader
-
-	// A context that can be used for long-running operations.
-	Context() context.Context
-
-	// Repond to the operation with the supplied error. If there is no error, set
-	// any necessary output fields and then call Respond(nil). The user must not
-	// call with a nil error for unrecognized ops; instead, use ENOSYS.
-	//
-	// Once this is invoked, the user must exclude any further calls to any
-	// method of this op.
-	Respond(error)
-
-	// Log information tied to this operation, with semantics equivalent to
-	// log.Printf, except that the format is different and logging is suppressed
-	// if --fuse.debug is not set.
-	Logf(format string, v ...interface{})
-}
-
 ////////////////////////////////////////////////////////////////////////
-// Setup
+// File system
 ////////////////////////////////////////////////////////////////////////
 
-// Sent once when mounting the file system. It must succeed in order for the
-// mount to succeed.
-type InitOp struct {
-	commonOp
+// Return statistics about the file system's capacity and available resources.
+//
+// Called by statfs(2) and friends:
+//
+//     * (https://goo.gl/Xi1lDr) sys_statfs called user_statfs, which calls
+//        vfs_statfs, which calls statfs_by_dentry.
+//
+//     * (https://goo.gl/VAIOwU) statfs_by_dentry calls the superblock
+//       operation statfs, which in our case points at
+//       fuse_statfs (cf. https://goo.gl/L7BTM3)
+//
+//     * (https://goo.gl/Zn7Sgl) fuse_statfs sends a statfs op, then uses
+//       convert_fuse_statfs to convert the response in a straightforward
+//       manner.
+//
+// This op is particularly important on OS X: if you don't implement it, the
+// file system will not successfully mount. If you don't model a sane amount of
+// free space, the Finder will refuse to copy files into the file system.
+type StatFSOp struct {
+	// The size of the file system's blocks. This may be used, in combination
+	// with the block counts below,  by callers of statfs(2) to infer the file
+	// system's capacity and space availability.
+	//
+	// On Linux this is surfaced as statfs::f_frsize, matching the posix standard
+	// (http://goo.gl/LktgrF), which says that f_blocks and friends are in units
+	// of f_frsize. On OS X this is surfaced as statfs::f_bsize, which plays the
+	// same roll.
+	//
+	// It appears as though the original intent of statvfs::f_frsize in the posix
+	// standard was to support a smaller addressable unit than statvfs::f_bsize
+	// (cf. The Linux Programming Interface by Michael Kerrisk,
+	// https://goo.gl/5LZMxQ). Therefore users should probably arrange for this
+	// to be no larger than IoSize.
+	//
+	// On Linux this can be any value, and will be faithfully returned to the
+	// caller of statfs(2) (see the code walk above). On OS X it appears that
+	// only powers of 2 in the range [2^9, 2^17] are preserved, and a value of
+	// zero is treated as 4096.
+	//
+	// This interface does not distinguish between blocks and block fragments.
+	BlockSize uint32
 
-	maxReadahead uint32
-}
+	// The total number of blocks in the file system, the number of unused
+	// blocks, and the count of the latter that are available for use by non-root
+	// users.
+	//
+	// For each category, the corresponding number of bytes is derived by
+	// multiplying by BlockSize.
+	Blocks          uint64
+	BlocksFree      uint64
+	BlocksAvailable uint64
 
-func (o *InitOp) toBazilfuseResponse() (bfResp interface{}) {
-	resp := bazilfuse.InitResponse{}
-	bfResp = &resp
+	// The preferred size of writes to and reads from the file system, in bytes.
+	// This may affect clients that use statfs(2) to size buffers correctly. It
+	// does not appear to influence the size of writes sent from the kernel to
+	// the file system daemon.
+	//
+	// On Linux this is surfaced as statfs::f_bsize, and on OS X as
+	// statfs::f_iosize. Both are documented in `man 2 statfs` as "optimal
+	// transfer block size".
+	//
+	// On Linux this can be any value. On OS X it appears that only powers of 2
+	// in the range [2^12, 2^20] are faithfully preserved, and a value of zero is
+	// treated as 65536.
+	IoSize uint32
 
-	// Ask the Linux kernel for larger write requests.
-	//
-	// As of 2015-03-26, the behavior in the kernel is:
-	//
-	//  *  (http://goo.gl/jMKHMZ, http://goo.gl/XTF4ZH) Cap the max write size at
-	//     the maximum of 4096 and init_response->max_write.
-	//
-	//  *  (http://goo.gl/gEIvHZ) If FUSE_BIG_WRITES isn't set, don't return more
-	//     than one page.
-	//
-	//  *  (http://goo.gl/4RLhxZ, http://goo.gl/hi0Cm2) Never write more than
-	//     FUSE_MAX_PAGES_PER_REQ pages (128 KiB on x86).
-	//
-	// 4 KiB is crazy small. Ask for significantly more, and take what the kernel
-	// will give us.
-	const maxWrite = 1 << 21
-	resp.Flags |= bazilfuse.InitBigWrites
-	resp.MaxWrite = maxWrite
-
-	// Ask the Linux kernel for larger read requests.
-	//
-	// As of 2015-03-26, the behavior in the kernel is:
-	//
-	//  *  (http://goo.gl/bQ1f1i, http://goo.gl/HwBrR6) Set the local variable
-	//     ra_pages to be init_response->max_readahead divided by the page size.
-	//
-	//  *  (http://goo.gl/gcIsSh, http://goo.gl/LKV2vA) Set
-	//     backing_dev_info::ra_pages to the min of that value and what was sent
-	//     in the request's max_readahead field.
-	//
-	//  *  (http://goo.gl/u2SqzH) Use backing_dev_info::ra_pages when deciding
-	//     how much to read ahead.
-	//
-	//  *  (http://goo.gl/JnhbdL) Don't read ahead at all if that field is zero.
-	//
-	// Reading a page at a time is a drag. Ask for as much as the kernel is
-	// willing to give us.
-	resp.MaxReadahead = o.maxReadahead
-
-	return
+	// The total number of inodes in the file system, and how many remain free.
+	Inodes     uint64
+	InodesFree uint64
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -118,8 +101,6 @@ func (o *InitOp) toBazilfuseResponse() (bfResp interface{}) {
 // Look up a child by name within a parent directory. The kernel sends this
 // when resolving user paths to dentry structs, which are then cached.
 type LookUpInodeOp struct {
-	commonOp
-
 	// The ID of the directory inode to which the child belongs.
 	Parent InodeID
 
@@ -141,27 +122,11 @@ type LookUpInodeOp struct {
 	Entry ChildInodeEntry
 }
 
-func (o *LookUpInodeOp) ShortDesc() (desc string) {
-	desc = fmt.Sprintf("LookUpInode(parent=%v, name=%q)", o.Parent, o.Name)
-	return
-}
-
-func (o *LookUpInodeOp) toBazilfuseResponse() (bfResp interface{}) {
-	resp := bazilfuse.LookupResponse{}
-	bfResp = &resp
-
-	convertChildInodeEntry(&o.Entry, &resp)
-
-	return
-}
-
 // Refresh the attributes for an inode whose ID was previously returned in a
 // LookUpInodeOp. The kernel sends this when the FUSE VFS layer's cache of
 // inode attributes is stale. This is controlled by the AttributesExpiration
 // field of ChildInodeEntry, etc.
 type GetInodeAttributesOp struct {
-	commonOp
-
 	// The inode of interest.
 	Inode InodeID
 
@@ -172,22 +137,11 @@ type GetInodeAttributesOp struct {
 	AttributesExpiration time.Time
 }
 
-func (o *GetInodeAttributesOp) toBazilfuseResponse() (bfResp interface{}) {
-	resp := bazilfuse.GetattrResponse{
-		Attr: convertAttributes(o.Inode, o.Attributes, o.AttributesExpiration),
-	}
-	bfResp = &resp
-
-	return
-}
-
 // Change attributes for an inode.
 //
 // The kernel sends this for obvious cases like chmod(2), and for less obvious
 // cases like ftrunctate(2).
 type SetInodeAttributesOp struct {
-	commonOp
-
 	// The inode of interest.
 	Inode InodeID
 
@@ -202,15 +156,6 @@ type SetInodeAttributesOp struct {
 	// ChildInodeEntry.AttributesExpiration for more.
 	Attributes           InodeAttributes
 	AttributesExpiration time.Time
-}
-
-func (o *SetInodeAttributesOp) toBazilfuseResponse() (bfResp interface{}) {
-	resp := bazilfuse.SetattrResponse{
-		Attr: convertAttributes(o.Inode, o.Attributes, o.AttributesExpiration),
-	}
-	bfResp = &resp
-
-	return
 }
 
 // Decrement the reference count for an inode ID previously issued by the file
@@ -253,17 +198,11 @@ func (o *SetInodeAttributesOp) toBazilfuseResponse() (bfResp interface{}) {
 // Rather they should take fuse.Connection.ReadOp returning io.EOF as
 // implicitly decrementing all lookup counts to zero.
 type ForgetInodeOp struct {
-	commonOp
-
 	// The inode whose reference count should be decremented.
 	Inode InodeID
 
 	// The amount to decrement the reference count.
 	N uint64
-}
-
-func (o *ForgetInodeOp) toBazilfuseResponse() (bfResp interface{}) {
-	return
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -282,8 +221,6 @@ func (o *ForgetInodeOp) toBazilfuseResponse() (bfResp interface{}) {
 //
 // Therefore the file system should return EEXIST if the name already exists.
 type MkDirOp struct {
-	commonOp
-
 	// The ID of parent directory inode within which to create the child.
 	Parent InodeID
 
@@ -298,18 +235,31 @@ type MkDirOp struct {
 	Entry ChildInodeEntry
 }
 
-func (o *MkDirOp) ShortDesc() (desc string) {
-	desc = fmt.Sprintf("MkDir(parent=%v, name=%q)", o.Parent, o.Name)
-	return
-}
+// Create a file inode as a child of an existing directory inode. The kernel
+// sends this in response to a mknod(2) call. It may also send it in special
+// cases such as an NFS export (cf. https://goo.gl/HiLfnK). It is more typical
+// to see CreateFileOp, which is received for an open(2) that creates a file.
+//
+// The Linux kernel appears to verify the name doesn't already exist (mknod
+// calls sys_mknodat calls user_path_create calls filename_create, which
+// verifies: http://goo.gl/FZpLu5). But osxfuse may not guarantee this, as with
+// mkdir(2). And if names may be created outside of the kernel's control, it
+// doesn't matter what the kernel does anyway.
+//
+// Therefore the file system should return EEXIST if the name already exists.
+type MkNodeOp struct {
+	// The ID of parent directory inode within which to create the child.
+	Parent InodeID
 
-func (o *MkDirOp) toBazilfuseResponse() (bfResp interface{}) {
-	resp := bazilfuse.MkdirResponse{}
-	bfResp = &resp
+	// The name of the child to create, and the mode with which to create it.
+	Name string
+	Mode os.FileMode
 
-	convertChildInodeEntry(&o.Entry, &resp.LookupResponse)
-
-	return
+	// Set by the file system: information about the inode that was created.
+	//
+	// The lookup count for the inode is implicitly incremented. See notes on
+	// ForgetInodeOp for more information.
+	Entry ChildInodeEntry
 }
 
 // Create a file inode and open it.
@@ -323,17 +273,12 @@ func (o *MkDirOp) toBazilfuseResponse() (bfResp interface{}) {
 //
 // Therefore the file system should return EEXIST if the name already exists.
 type CreateFileOp struct {
-	commonOp
-
 	// The ID of parent directory inode within which to create the child file.
 	Parent InodeID
 
 	// The name of the child to create, and the mode with which to create it.
 	Name string
 	Mode os.FileMode
-
-	// Flags for the open operation.
-	Flags bazilfuse.OpenFlags
 
 	// Set by the file system: information about the inode that was created.
 	//
@@ -352,29 +297,9 @@ type CreateFileOp struct {
 	Handle HandleID
 }
 
-func (o *CreateFileOp) ShortDesc() (desc string) {
-	desc = fmt.Sprintf("CreateFile(parent=%v, name=%q)", o.Parent, o.Name)
-	return
-}
-
-func (o *CreateFileOp) toBazilfuseResponse() (bfResp interface{}) {
-	resp := bazilfuse.CreateResponse{
-		OpenResponse: bazilfuse.OpenResponse{
-			Handle: bazilfuse.HandleID(o.Handle),
-		},
-	}
-	bfResp = &resp
-
-	convertChildInodeEntry(&o.Entry, &resp.LookupResponse)
-
-	return
-}
-
 // Create a symlink inode. If the name already exists, the file system should
 // return EEXIST (cf. the notes on CreateFileOp and MkDirOp).
 type CreateSymlinkOp struct {
-	commonOp
-
 	// The ID of parent directory inode within which to create the child symlink.
 	Parent InodeID
 
@@ -392,29 +317,55 @@ type CreateSymlinkOp struct {
 	Entry ChildInodeEntry
 }
 
-func (o *CreateSymlinkOp) ShortDesc() (desc string) {
-	desc = fmt.Sprintf(
-		"CreateSymlink(parent=%v, name=%q, target=%q)",
-		o.Parent,
-		o.Name,
-		o.Target)
-
-	return
-}
-
-func (o *CreateSymlinkOp) toBazilfuseResponse() (bfResp interface{}) {
-	resp := bazilfuse.SymlinkResponse{}
-	bfResp = &resp
-
-	convertChildInodeEntry(&o.Entry, &resp.LookupResponse)
-
-	return
-	return
-}
-
 ////////////////////////////////////////////////////////////////////////
 // Unlinking
 ////////////////////////////////////////////////////////////////////////
+
+// Rename a file or directory, given the IDs of the original parent directory
+// and the new one (which may be the same).
+//
+// In Linux, this is called by vfs_rename (https://goo.gl/eERItT), which is
+// called by sys_renameat2 (https://goo.gl/fCC9qC).
+//
+// The kernel takes care of ensuring that the source and destination are not
+// identical (in which case it does nothing), that the rename is not across
+// file system boundaries, and that the destination doesn't already exist with
+// the wrong type. Some subtleties that the file system must care about:
+//
+//  *  If the new name is an existing directory, the file system must ensure it
+//     is empty before replacing it, returning ENOTEMPTY otherwise. (This is
+//     per the posix spec: http://goo.gl/4XtT79)
+//
+//  *  The rename must be atomic from the point of view of an observer of the
+//     new name. That is, if the new name already exists, there must be no
+//     point at which it doesn't exist.
+//
+//  *  It is okay for the new name to be modified before the old name is
+//     removed; these need not be atomic. In fact, the Linux man page
+//     explicitly says this is likely (cf. https://goo.gl/Y1wVZc).
+//
+//  *  Linux bends over backwards (https://goo.gl/pLDn3r) to ensure that
+//     neither the old nor the new parent can be concurrently modified. But
+//     it's not clear whether OS X does this, and in any case it doesn't matter
+//     for file systems that may be modified remotely. Therefore a careful file
+//     system implementor should probably ensure if possible that the unlink
+//     step in the "link new name, unlink old name" process doesn't unlink a
+//     different inode than the one that was linked to the new name. Still,
+//     posix and the man pages are imprecise about the actual semantics of a
+//     rename if it's not atomic, so it is probably not disastrous to be loose
+//     about this.
+//
+type RenameOp struct {
+	// The old parent directory, and the name of the entry within it to be
+	// relocated.
+	OldParent InodeID
+	OldName   string
+
+	// The new parent directory, and the name of the entry to be created or
+	// overwritten within it.
+	NewParent InodeID
+	NewName   string
+}
 
 // Unlink a directory from its parent. Because directories cannot have a link
 // count above one, this means the directory inode should be deleted as well
@@ -424,16 +375,10 @@ func (o *CreateSymlinkOp) toBazilfuseResponse() (bfResp interface{}) {
 //
 // Sample implementation in ext2: ext2_rmdir (http://goo.gl/B9QmFf)
 type RmDirOp struct {
-	commonOp
-
 	// The ID of parent directory inode, and the name of the directory being
 	// removed within it.
 	Parent InodeID
 	Name   string
-}
-
-func (o *RmDirOp) toBazilfuseResponse() (bfResp interface{}) {
-	return
 }
 
 // Unlink a file or symlink from its parent. If this brings the inode's link
@@ -443,16 +388,10 @@ func (o *RmDirOp) toBazilfuseResponse() (bfResp interface{}) {
 //
 // Sample implementation in ext2: ext2_unlink (http://goo.gl/hY6r6C)
 type UnlinkOp struct {
-	commonOp
-
 	// The ID of parent directory inode, and the name of the entry being removed
 	// within it.
 	Parent InodeID
 	Name   string
-}
-
-func (o *UnlinkOp) toBazilfuseResponse() (bfResp interface{}) {
-	return
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -466,13 +405,8 @@ func (o *UnlinkOp) toBazilfuseResponse() (bfResp interface{}) {
 // user-space process. On OS X it may not be sent for every open(2) (cf.
 // https://github.com/osxfuse/osxfuse/issues/199).
 type OpenDirOp struct {
-	commonOp
-
 	// The ID of the inode to be opened.
 	Inode InodeID
-
-	// Mode and options flags.
-	Flags bazilfuse.OpenFlags
 
 	// Set by the file system: an opaque ID that will be echoed in follow-up
 	// calls for this directory using the same struct file in the kernel. In
@@ -485,19 +419,8 @@ type OpenDirOp struct {
 	Handle HandleID
 }
 
-func (o *OpenDirOp) toBazilfuseResponse() (bfResp interface{}) {
-	resp := bazilfuse.OpenResponse{
-		Handle: bazilfuse.HandleID(o.Handle),
-	}
-	bfResp = &resp
-
-	return
-}
-
 // Read entries from a directory previously opened with OpenDir.
 type ReadDirOp struct {
-	commonOp
-
 	// The directory inode that we are reading, and the handle previously
 	// returned by OpenDir when opening that inode.
 	Inode  InodeID
@@ -563,34 +486,29 @@ type ReadDirOp struct {
 	// offset, and return array offsets into that cached listing.
 	Offset DirOffset
 
-	// The maximum number of bytes to return in ReadDirResponse.Data. A smaller
-	// number is acceptable.
-	Size int
-
-	// Set by the file system: a buffer consisting of a sequence of FUSE
-	// directory entries in the format generated by fuse_add_direntry
-	// (http://goo.gl/qCcHCV), which is consumed by parse_dirfile
-	// (http://goo.gl/2WUmD2). Use fuseutil.AppendDirent to generate this data.
+	// The destination buffer, whose length gives the size of the read.
 	//
-	// The buffer must not exceed the length specified in ReadDirRequest.Size. It
-	// is okay for the final entry to be truncated; parse_dirfile copes with this
-	// by ignoring the partial record.
+	// The output data should consist of a sequence of FUSE directory entries in
+	// the format generated by fuse_add_direntry (http://goo.gl/qCcHCV), which is
+	// consumed by parse_dirfile (http://goo.gl/2WUmD2). Use fuseutil.WriteDirent
+	// to generate this data.
 	//
 	// Each entry returned exposes a directory offset to the user that may later
 	// show up in ReadDirRequest.Offset. See notes on that field for more
 	// information.
+	Dst []byte
+
+	// Set by the file system: the number of bytes read into Dst.
 	//
-	// An empty buffer indicates the end of the directory has been reached.
-	Data []byte
-}
-
-func (o *ReadDirOp) toBazilfuseResponse() (bfResp interface{}) {
-	resp := bazilfuse.ReadResponse{
-		Data: o.Data,
-	}
-	bfResp = &resp
-
-	return
+	// It is okay for this to be less than len(Dst) if there are not enough
+	// entries available or the final entry would not fit.
+	//
+	// Zero means that the end of the directory has been reached. This is
+	// unambiguous because NAME_MAX (https://goo.gl/ZxzKaE) plus the size of
+	// fuse_dirent (https://goo.gl/WO8s3F) plus the 8-byte alignment of
+	// FUSE_DIRENT_ALIGN (http://goo.gl/UziWvH) is less than the read size of
+	// PAGE_SIZE used by fuse_readdir (cf. https://goo.gl/VajtS2).
+	BytesRead int
 }
 
 // Release a previously-minted directory handle. The kernel sends this when
@@ -602,16 +520,10 @@ func (o *ReadDirOp) toBazilfuseResponse() (bfResp interface{}) {
 //
 // Errors from this op are ignored by the kernel (cf. http://goo.gl/RL38Do).
 type ReleaseDirHandleOp struct {
-	commonOp
-
 	// The handle ID to be released. The kernel guarantees that this ID will not
 	// be used in further calls to the file system (unless it is reissued by the
 	// file system).
 	Handle HandleID
-}
-
-func (o *ReleaseDirHandleOp) toBazilfuseResponse() (bfResp interface{}) {
-	return
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -625,13 +537,8 @@ func (o *ReleaseDirHandleOp) toBazilfuseResponse() (bfResp interface{}) {
 // process. On OS X it may not be sent for every open(2)
 // (cf.https://github.com/osxfuse/osxfuse/issues/199).
 type OpenFileOp struct {
-	commonOp
-
 	// The ID of the inode to be opened.
 	Inode InodeID
-
-	// Mode and options flags.
-	Flags bazilfuse.OpenFlags
 
 	// An opaque ID that will be echoed in follow-up calls for this file using
 	// the same struct file in the kernel. In practice this usually means
@@ -641,15 +548,22 @@ type OpenFileOp struct {
 	// file handle. The file system must ensure this ID remains valid until a
 	// later call to ReleaseFileHandle.
 	Handle HandleID
-}
 
-func (o *OpenFileOp) toBazilfuseResponse() (bfResp interface{}) {
-	resp := bazilfuse.OpenResponse{
-		Handle: bazilfuse.HandleID(o.Handle),
-	}
-	bfResp = &resp
-
-	return
+	// By default, fuse invalidates the kernel's page cache for an inode when a
+	// new file handle is opened for that inode (cf. https://goo.gl/2rZ9uk). The
+	// intent appears to be to allow users to "see" content that has changed
+	// remotely on a networked file system by re-opening the file.
+	//
+	// For file systems where this is not a concern because all modifications for
+	// a particular inode go through the kernel, set this field to true to
+	// disable this behavior.
+	//
+	// (More discussion: http://goo.gl/cafzWF)
+	//
+	// Note that on OS X it appears that the behavior is always as if this field
+	// is set to true, regardless of its value, at least for files opened in the
+	// same mode. (Cf. https://github.com/osxfuse/osxfuse/issues/223)
+	KeepPageCache bool
 }
 
 // Read data from a file previously opened with CreateFile or OpenFile.
@@ -658,36 +572,26 @@ func (o *OpenFileOp) toBazilfuseResponse() (bfResp interface{}) {
 // some reads may be served by the page cache. See notes on WriteFileOp for
 // more.
 type ReadFileOp struct {
-	commonOp
-
 	// The file inode that we are reading, and the handle previously returned by
 	// CreateFile or OpenFile when opening that inode.
 	Inode  InodeID
 	Handle HandleID
 
-	// The range of the file to read.
+	// The offset within the file at which to read.
+	Offset int64
+
+	// The destination buffer, whose length gives the size of the read.
+	Dst []byte
+
+	// Set by the file system: the number of bytes read.
 	//
-	// The FUSE documentation requires that exactly the number of bytes be
-	// returned, except in the case of EOF or error (http://goo.gl/ZgfBkF). This
-	// appears to be because it uses file mmapping machinery
+	// The FUSE documentation requires that exactly the requested number of bytes
+	// be returned, except in the case of EOF or error (http://goo.gl/ZgfBkF).
+	// This appears to be because it uses file mmapping machinery
 	// (http://goo.gl/SGxnaN) to read a page at a time. It appears to understand
 	// where EOF is by checking the inode size (http://goo.gl/0BkqKD), returned
 	// by a previous call to LookUpInode, GetInodeAttributes, etc.
-	Offset int64
-	Size   int
-
-	// Set by the file system: the data read. If this is less than the requested
-	// size, it indicates EOF. An error should not be returned in this case.
-	Data []byte
-}
-
-func (o *ReadFileOp) toBazilfuseResponse() (bfResp interface{}) {
-	resp := bazilfuse.ReadResponse{
-		Data: o.Data,
-	}
-	bfResp = &resp
-
-	return
+	BytesRead int
 }
 
 // Write data to a file previously opened with CreateFile or OpenFile.
@@ -707,23 +611,12 @@ func (o *ReadFileOp) toBazilfuseResponse() (bfResp interface{}) {
 //
 // Note that the kernel *will* ensure that writes are received and acknowledged
 // by the file system before sending a FlushFileOp when closing the file
-// descriptor to which they were written:
-//
-//  *  (http://goo.gl/PheZjf) fuse_flush calls write_inode_now, which appears
-//     to start a writeback in the background (it talks about a "flusher
-//     thread").
-//
-//  *  (http://goo.gl/1IiepM) fuse_flush then calls fuse_sync_writes, which
-//     "[waits] for all pending writepages on the inode to finish".
-//
-//  *  (http://goo.gl/zzvxWv) Only then does fuse_flush finally send the
-//     flush request.
+// descriptor to which they were written. Cf. the notes on
+// fuse.MountConfig.DisableWritebackCaching.
 //
 // (See also http://goo.gl/ocdTdM, fuse-devel thread "Fuse guarantees on
 // concurrent requests".)
 type WriteFileOp struct {
-	commonOp
-
 	// The file inode that we are modifying, and the handle previously returned
 	// by CreateFile or OpenFile when opening that inode.
 	Inode  InodeID
@@ -760,15 +653,6 @@ type WriteFileOp struct {
 	Data []byte
 }
 
-func (o *WriteFileOp) toBazilfuseResponse() (bfResp interface{}) {
-	resp := bazilfuse.WriteResponse{
-		Size: len(o.Data),
-	}
-	bfResp = &resp
-
-	return
-}
-
 // Synchronize the current contents of an open file to storage.
 //
 // vfs.txt documents this as being called for by the fsync(2) system call
@@ -786,15 +670,9 @@ func (o *WriteFileOp) toBazilfuseResponse() (bfResp interface{}) {
 // See also: FlushFileOp, which may perform a similar function when closing a
 // file (but which is not used in "real" file systems).
 type SyncFileOp struct {
-	commonOp
-
 	// The file and handle being sync'd.
 	Inode  InodeID
 	Handle HandleID
-}
-
-func (o *SyncFileOp) toBazilfuseResponse() (bfResp interface{}) {
-	return
 }
 
 // Flush the current state of an open file to storage upon closing a file
@@ -845,15 +723,9 @@ func (o *SyncFileOp) toBazilfuseResponse() (bfResp interface{}) {
 // to at least schedule a real flush, and maybe do it immediately in order to
 // return any errors that occur.
 type FlushFileOp struct {
-	commonOp
-
 	// The file and handle being flushed.
 	Inode  InodeID
 	Handle HandleID
-}
-
-func (o *FlushFileOp) toBazilfuseResponse() (bfResp interface{}) {
-	return
 }
 
 // Release a previously-minted file handle. The kernel calls this when there
@@ -865,26 +737,10 @@ func (o *FlushFileOp) toBazilfuseResponse() (bfResp interface{}) {
 //
 // Errors from this op are ignored by the kernel (cf. http://goo.gl/RL38Do).
 type ReleaseFileHandleOp struct {
-	commonOp
-
 	// The handle ID to be released. The kernel guarantees that this ID will not
 	// be used in further calls to the file system (unless it is reissued by the
 	// file system).
 	Handle HandleID
-}
-
-func (o *ReleaseFileHandleOp) toBazilfuseResponse() (bfResp interface{}) {
-	return
-}
-
-// A sentinel used for unknown ops. The user is expected to respond with a
-// non-nil error.
-type unknownOp struct {
-	commonOp
-}
-
-func (o *unknownOp) toBazilfuseResponse() (bfResp interface{}) {
-	panic(fmt.Sprintf("Should never get here for unknown op: %s", o.ShortDesc()))
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -893,16 +749,9 @@ func (o *unknownOp) toBazilfuseResponse() (bfResp interface{}) {
 
 // Read the target of a symlink inode.
 type ReadSymlinkOp struct {
-	commonOp
-
 	// The symlink inode that we are reading.
 	Inode InodeID
 
 	// Set by the file system: the target of the symlink.
 	Target string
-}
-
-func (o *ReadSymlinkOp) toBazilfuseResponse() (bfResp interface{}) {
-	bfResp = o.Target
-	return
 }

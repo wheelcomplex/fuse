@@ -22,30 +22,22 @@ import (
 
 	"github.com/jacobsa/fuse/fuseops"
 	"github.com/jacobsa/fuse/fuseutil"
-	"github.com/jacobsa/syncutil"
-	"github.com/jacobsa/timeutil"
 )
 
 // Common attributes for files and directories.
+//
+// External synchronization is required.
 type inode struct {
-	/////////////////////////
-	// Dependencies
-	/////////////////////////
-
-	clock timeutil.Clock
-
 	/////////////////////////
 	// Mutable state
 	/////////////////////////
-
-	mu syncutil.InvariantMutex
 
 	// The current attributes of this inode.
 	//
 	// INVARIANT: attrs.Mode &^ (os.ModePerm|os.ModeDir|os.ModeSymlink) == 0
 	// INVARIANT: !(isDir() && isSymlink())
 	// INVARIANT: attrs.Size == len(contents)
-	attrs fuseops.InodeAttributes // GUARDED_BY(mu)
+	attrs fuseops.InodeAttributes
 
 	// For directories, entries describing the children of the directory. Unused
 	// entries are of type DT_Unknown.
@@ -58,18 +50,16 @@ type inode struct {
 	// INVARIANT: If !isDir(), len(entries) == 0
 	// INVARIANT: For each i, entries[i].Offset == i+1
 	// INVARIANT: Contains no duplicate names in used entries.
-	entries []fuseutil.Dirent // GUARDED_BY(mu)
+	entries []fuseutil.Dirent
 
 	// For files, the current contents of the file.
 	//
 	// INVARIANT: If !isFile(), len(contents) == 0
-	contents []byte // GUARDED_BY(mu)
+	contents []byte
 
 	// For symlinks, the target of the symlink.
 	//
 	// INVARIANT: If !isSymlink(), len(target) == 0
-	//
-	// GUARDED_BY(mu)
 	target string
 }
 
@@ -80,24 +70,21 @@ type inode struct {
 // Create a new inode with the supplied attributes, which need not contain
 // time-related information (the inode object will take care of that).
 func newInode(
-	clock timeutil.Clock,
 	attrs fuseops.InodeAttributes) (in *inode) {
 	// Update time info.
-	now := clock.Now()
+	now := time.Now()
 	attrs.Mtime = now
 	attrs.Crtime = now
 
 	// Create the object.
 	in = &inode{
-		clock: clock,
 		attrs: attrs,
 	}
 
-	in.mu = syncutil.NewInvariantMutex(in.checkInvariants)
 	return
 }
 
-func (in *inode) checkInvariants() {
+func (in *inode) CheckInvariants() {
 	// INVARIANT: attrs.Mode &^ (os.ModePerm|os.ModeDir|os.ModeSymlink) == 0
 	if !(in.attrs.Mode&^(os.ModePerm|os.ModeDir|os.ModeSymlink) == 0) {
 		panic(fmt.Sprintf("Unexpected mode: %v", in.attrs.Mode))
@@ -153,25 +140,21 @@ func (in *inode) checkInvariants() {
 	return
 }
 
-// LOCKS_REQUIRED(in.mu)
 func (in *inode) isDir() bool {
 	return in.attrs.Mode&os.ModeDir != 0
 }
 
-// LOCKS_REQUIRED(in.mu)
 func (in *inode) isSymlink() bool {
 	return in.attrs.Mode&os.ModeSymlink != 0
 }
 
-// LOCKS_REQUIRED(in.mu)
 func (in *inode) isFile() bool {
 	return !(in.isDir() || in.isSymlink())
 }
 
 // Return the index of the child within in.entries, if it exists.
 //
-// REQUIRES: in.dir
-// LOCKS_REQUIRED(in.mu)
+// REQUIRES: in.isDir()
 func (in *inode) findChild(name string) (i int, ok bool) {
 	if !in.isDir() {
 		panic("findChild called on non-directory.")
@@ -195,7 +178,6 @@ func (in *inode) findChild(name string) (i int, ok bool) {
 // Return the number of children of the directory.
 //
 // REQUIRES: in.isDir()
-// LOCKS_REQUIRED(in.mu)
 func (in *inode) Len() (n int) {
 	for _, e := range in.entries {
 		if e.Type != fuseutil.DT_Unknown {
@@ -209,11 +191,14 @@ func (in *inode) Len() (n int) {
 // Find an entry for the given child name and return its inode ID.
 //
 // REQUIRES: in.isDir()
-// LOCKS_REQUIRED(in.mu)
-func (in *inode) LookUpChild(name string) (id fuseops.InodeID, ok bool) {
+func (in *inode) LookUpChild(name string) (
+	id fuseops.InodeID,
+	typ fuseutil.DirentType,
+	ok bool) {
 	index, ok := in.findChild(name)
 	if ok {
 		id = in.entries[index].Inode
+		typ = in.entries[index].Type
 	}
 
 	return
@@ -223,7 +208,6 @@ func (in *inode) LookUpChild(name string) (id fuseops.InodeID, ok bool) {
 //
 // REQUIRES: in.isDir()
 // REQUIRES: dt != fuseutil.DT_Unknown
-// LOCKS_REQUIRED(in.mu)
 func (in *inode) AddChild(
 	id fuseops.InodeID,
 	name string,
@@ -231,7 +215,7 @@ func (in *inode) AddChild(
 	var index int
 
 	// Update the modification time.
-	in.attrs.Mtime = in.clock.Now()
+	in.attrs.Mtime = time.Now()
 
 	// No matter where we place the entry, make sure it has the correct Offset
 	// field.
@@ -263,10 +247,9 @@ func (in *inode) AddChild(
 //
 // REQUIRES: in.isDir()
 // REQUIRES: An entry for the given name exists.
-// LOCKS_REQUIRED(in.mu)
 func (in *inode) RemoveChild(name string) {
 	// Update the modification time.
-	in.attrs.Mtime = in.clock.Now()
+	in.attrs.Mtime = time.Now()
 
 	// Find the entry.
 	i, ok := in.findChild(name)
@@ -284,8 +267,7 @@ func (in *inode) RemoveChild(name string) {
 // Serve a ReadDir request.
 //
 // REQUIRES: in.isDir()
-// LOCKS_REQUIRED(in.mu)
-func (in *inode) ReadDir(offset int, size int) (data []byte, err error) {
+func (in *inode) ReadDir(p []byte, offset int) (n int) {
 	if !in.isDir() {
 		panic("ReadDir called on non-directory.")
 	}
@@ -298,13 +280,12 @@ func (in *inode) ReadDir(offset int, size int) (data []byte, err error) {
 			continue
 		}
 
-		data = fuseutil.AppendDirent(data, in.entries[i])
-
-		// Trim and stop early if we've exceeded the requested size.
-		if len(data) > size {
-			data = data[:size]
+		tmp := fuseutil.WriteDirent(p[n:], in.entries[i])
+		if tmp == 0 {
 			break
 		}
+
+		n += tmp
 	}
 
 	return
@@ -313,7 +294,6 @@ func (in *inode) ReadDir(offset int, size int) (data []byte, err error) {
 // Read from the file's contents. See documentation for ioutil.ReaderAt.
 //
 // REQUIRES: in.isFile()
-// LOCKS_REQUIRED(in.mu)
 func (in *inode) ReadAt(p []byte, off int64) (n int, err error) {
 	if !in.isFile() {
 		panic("ReadAt called on non-file.")
@@ -337,14 +317,13 @@ func (in *inode) ReadAt(p []byte, off int64) (n int, err error) {
 // Write to the file's contents. See documentation for ioutil.WriterAt.
 //
 // REQUIRES: in.isFile()
-// LOCKS_REQUIRED(in.mu)
 func (in *inode) WriteAt(p []byte, off int64) (n int, err error) {
 	if !in.isFile() {
 		panic("WriteAt called on non-file.")
 	}
 
 	// Update the modification time.
-	in.attrs.Mtime = in.clock.Now()
+	in.attrs.Mtime = time.Now()
 
 	// Ensure that the contents slice is long enough.
 	newLen := int(off) + len(p)
@@ -366,14 +345,12 @@ func (in *inode) WriteAt(p []byte, off int64) (n int, err error) {
 }
 
 // Update attributes from non-nil parameters.
-//
-// LOCKS_REQUIRED(in.mu)
 func (in *inode) SetAttributes(
 	size *uint64,
 	mode *os.FileMode,
 	mtime *time.Time) {
 	// Update the modification time.
-	in.attrs.Mtime = in.clock.Now()
+	in.attrs.Mtime = time.Now()
 
 	// Truncate?
 	if size != nil {
